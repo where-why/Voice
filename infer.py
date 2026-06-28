@@ -1,4 +1,4 @@
-"""TTS 推理：文本 -> Mel -> 波形"""
+"""文字转语音推理"""
 from pathlib import Path
 
 import torch
@@ -9,31 +9,22 @@ from data_utils.audio import AudioProcessor
 from data_utils.text import TextProcessor
 from models.tacotron2 import Tacotron2
 
-# ==================== 配置（按需修改） ====================
-ROOT = Path(__file__).resolve().parent
-CACHE_DIR = ROOT / "train_data" / "processed"
-CHECKPOINT_DIR = ROOT / "checkpoints"
-OUTPUT_DIR = ROOT / "outputs"
-
-TEXT = "乡村振兴，人才是关键。"
-CHECKPOINT = CHECKPOINT_DIR / "tacotron2_best.pt"
-OUTPUT = OUTPUT_DIR / "output.wav"
-# ==========================================================
+TEXT = "绿是阳春烟景大块的底色四月的林峦更是绿得鲜活秀媚诗意盎然"
+CHECKPOINT = config.CHECKPOINT_DIR / "tacotron2_best.pt"
+OUTPUT = config.OUTPUT_DIR / "output.wav"
 
 
-def synthesize(text: str, checkpoint: Path, output_path: Path) -> Path:
+def synthesize(text: str, checkpoint: Path, output_path: Path) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    vocab_path = CACHE_DIR / "vocab.json"
+    vocab_path = config.TRAIN_CACHE_DIR / "vocab.json"
     if not vocab_path.exists():
-        raise FileNotFoundError("请先运行 python preprocess.py 进行数据预处理")
+        raise FileNotFoundError("请先运行 preprocess.py")
 
     text_processor = TextProcessor()
     text_processor.load(vocab_path)
 
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
-    n_symbols = ckpt.get("n_symbols", text_processor.n_symbols)
-    model = Tacotron2(n_symbols=n_symbols).to(device)
+    model = Tacotron2(n_symbols=ckpt.get("n_symbols", text_processor.n_symbols)).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
 
@@ -43,14 +34,10 @@ def synthesize(text: str, checkpoint: Path, output_path: Path) -> Path:
     with torch.no_grad():
         mel = model.infer(text_ids, text_lengths)
 
-    audio_processor = AudioProcessor()
-    waveform = audio_processor.mel_to_wav(mel.squeeze(0).cpu())
-
+    waveform = AudioProcessor().mel_to_wav(mel.squeeze(0).cpu())
     output_path.parent.mkdir(parents=True, exist_ok=True)
     torchaudio.save(str(output_path), waveform.unsqueeze(0), config.SAMPLE_RATE)
-    duration = waveform.shape[-1] / config.SAMPLE_RATE
-    print(f"已生成语音: {output_path} ({duration:.2f}s)")
-    return output_path
+    print(f"已保存: {output_path} ({waveform.shape[-1] / config.SAMPLE_RATE:.2f}s)")
 
 
 if __name__ == "__main__":

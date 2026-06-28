@@ -1,6 +1,19 @@
-"""模型与音频处理配置（训练/推理路径请在各脚本顶部修改）"""
+"""项目配置"""
+from pathlib import Path
 
-# 音频参数
+ROOT = Path(__file__).resolve().parent
+
+# THCHS-30
+THCHS30_ROOT = ROOT / "data" / "data_thchs30"
+THCHS30_TRAIN_DIR = THCHS30_ROOT / "train"
+THCHS30_DEV_DIR = THCHS30_ROOT / "dev"
+
+TRAIN_CACHE_DIR = ROOT / "data" / "processed" / "train"
+DEV_CACHE_DIR = ROOT / "data" / "processed" / "dev"
+CHECKPOINT_DIR = ROOT / "checkpoints"
+OUTPUT_DIR = ROOT / "outputs"
+
+# 音频
 SAMPLE_RATE = 22050
 N_FFT = 1024
 HOP_LENGTH = 256
@@ -14,30 +27,25 @@ PAD_TOKEN = "_"
 EOS_TOKEN = "~"
 PUNCTUATION = "，。！？、；：""''（）《》【】…—"
 
-# 模型超参数
+# 模型
 SYMBOL_EMBEDDING_DIM = 512
 ENCODER_CONV_CHANNELS = 512
 ENCODER_KERNEL_SIZE = 5
 ENCODER_N_CONV = 3
 ENCODER_LSTM_HIDDEN = 256
-
 ATTENTION_RNN_DIM = 1024
 ATTENTION_DIM = 128
 ATTENTION_LOCATION_N_FILTERS = 32
 ATTENTION_LOCATION_KERNEL_SIZE = 31
-
 DECODER_RNN_DIM = 1024
 PRENET_DIM = 256
 POSTNET_N_CONV = 5
 POSTNET_CHANNELS = 512
 POSTNET_KERNEL_SIZE = 5
-
 MAX_DECODER_STEPS = 2000
 GATE_THRESHOLD = 0.5
 
-# 训练顺序分段（每段 512 帧 Mel ≈ 6 秒，对应约 200 字）
+# 长音频分段（THCHS-30 短句通常不切分）
 SEGMENT_MEL_FRAMES = 512
 SEGMENT_TEXT_LEN = 200
-
-# 推理
 GRIFFIN_LIM_ITERS = 60

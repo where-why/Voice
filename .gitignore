@@ -18,6 +18,7 @@ checkpoints/
 outputs/
 train_data/
 vel_data/
+data/
 
 /cypress/videos/
 /cypress/screenshots/

@@ -1,74 +1,60 @@
-"""数据预处理：构建词表、缓存 Mel 频谱"""
-from pathlib import Path
-
+"""THCHS-30 预处理"""
 import torch
 from tqdm import tqdm
 
+import config
 from data_utils.audio import AudioProcessor
-from data_utils.dataset import discover_samples
+from data_utils.dataset import discover_thchs30_samples
 from data_utils.text import TextProcessor
 
-# ==================== 配置（按需修改） ====================
-ROOT = Path(__file__).resolve().parent
-TRAIN_VOICE_DIR = ROOT / "train_data" / "voice"
-TRAIN_LABEL_DIR = ROOT / "train_data" / "label"
-TRAIN_CACHE_DIR = ROOT / "train_data" / "processed"
-
-VAL_VOICE_DIR = ROOT / "vel_data" / "voice"
-VAL_LABEL_DIR = ROOT / "vel_data" / "label"
-VAL_CACHE_DIR = ROOT / "vel_data" / "processed"
-
-FORCE = False  # True 时强制重新处理
-# ==========================================================
+FORCE = False
 
 
-def _cache_mel_samples(samples, audio_processor, force: bool) -> None:
-    for sample in tqdm(samples, desc="提取 Mel 频谱"):
+def _cache_mel(samples, audio_processor: AudioProcessor) -> None:
+    for sample in tqdm(samples, desc="提取 Mel"):
         cache_path = sample["mel_cache"]
-        if cache_path.exists() and not force:
+        if cache_path.exists() and not FORCE:
+            if sample.get("mel_frames", 0) <= 0:
+                sample["mel_frames"] = torch.load(cache_path, weights_only=True).size(1)
             continue
         mel = audio_processor.load_mel(sample["audio_path"])
+        sample["mel_frames"] = mel.size(1)
         torch.save(mel, cache_path)
 
 
 def preprocess() -> None:
-    train_samples = discover_samples(TRAIN_VOICE_DIR, TRAIN_LABEL_DIR, TRAIN_CACHE_DIR)
+    train_samples = discover_thchs30_samples(config.THCHS30_TRAIN_DIR, config.TRAIN_CACHE_DIR)
+    dev_samples = discover_thchs30_samples(config.THCHS30_DEV_DIR, config.DEV_CACHE_DIR)
     if not train_samples:
-        raise FileNotFoundError(f"未找到训练数据，请检查 {TRAIN_VOICE_DIR} 与 {TRAIN_LABEL_DIR}")
+        raise FileNotFoundError(f"未找到训练集: {config.THCHS30_TRAIN_DIR}")
 
-    val_samples = discover_samples(VAL_VOICE_DIR, VAL_LABEL_DIR, VAL_CACHE_DIR)
-    print(f"训练样本: {len(train_samples)} 条，验证样本: {len(val_samples)} 条")
+    for cache_dir in (config.TRAIN_CACHE_DIR, config.DEV_CACHE_DIR):
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "mel").mkdir(exist_ok=True)
 
-    TRAIN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    (TRAIN_CACHE_DIR / "mel").mkdir(parents=True, exist_ok=True)
-    if val_samples:
-        VAL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        (VAL_CACHE_DIR / "mel").mkdir(parents=True, exist_ok=True)
+    print(f"训练 {len(train_samples)} 条，验证 {len(dev_samples)} 条")
 
-    vocab_path = TRAIN_CACHE_DIR / "vocab.json"
-    text_processor = TextProcessor()
     label_files = [s["label_path"] for s in train_samples]
-    if val_samples:
-        label_files.extend([s["label_path"] for s in val_samples])
+    label_files.extend(s["label_path"] for s in dev_samples)
 
+    vocab_path = config.TRAIN_CACHE_DIR / "vocab.json"
+    text_processor = TextProcessor()
     if vocab_path.exists() and not FORCE:
         text_processor.load(vocab_path)
-        print(f"加载已有词表: {vocab_path} ({text_processor.n_symbols} 个符号)")
     else:
         text_processor.build_vocab(label_files)
         text_processor.save(vocab_path)
-        print(f"构建词表: {text_processor.n_symbols} 个符号 -> {vocab_path}")
+    print(f"词表: {text_processor.n_symbols} 个符号")
 
     audio_processor = AudioProcessor()
-    _cache_mel_samples(train_samples, audio_processor, FORCE)
-    if val_samples:
-        _cache_mel_samples(val_samples, audio_processor, FORCE)
+    _cache_mel(train_samples, audio_processor)
+    if dev_samples:
+        _cache_mel(dev_samples, audio_processor)
 
-    torch.save(train_samples, TRAIN_CACHE_DIR / "samples.pt")
-    if val_samples:
-        torch.save(val_samples, VAL_CACHE_DIR / "samples.pt")
-
-    print(f"预处理完成\n  训练缓存: {TRAIN_CACHE_DIR}\n  验证缓存: {VAL_CACHE_DIR}")
+    torch.save(train_samples, config.TRAIN_CACHE_DIR / "samples.pt")
+    if dev_samples:
+        torch.save(dev_samples, config.DEV_CACHE_DIR / "samples.pt")
+    print("预处理完成")
 
 
 if __name__ == "__main__":

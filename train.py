@@ -1,4 +1,4 @@
-"""Tacotron2 模型训练"""
+"""模型训练"""
 import random
 from pathlib import Path
 
@@ -8,22 +8,10 @@ from tqdm import tqdm
 
 import config
 from data_utils.audio import AudioProcessor
-from data_utils.dataset import TTSDataset, discover_samples, tts_collate_fn
+from data_utils.dataset import TTSDataset, discover_thchs30_samples, tts_collate_fn
 from data_utils.text import TextProcessor
 from models.loss import Tacotron2Loss
 from models.tacotron2 import Tacotron2
-
-# ==================== 配置（按需修改） ====================
-ROOT = Path(__file__).resolve().parent
-TRAIN_VOICE_DIR = ROOT / "train_data" / "voice"
-TRAIN_LABEL_DIR = ROOT / "train_data" / "label"
-TRAIN_CACHE_DIR = ROOT / "train_data" / "processed"
-
-VAL_VOICE_DIR = ROOT / "vel_data" / "voice"
-VAL_LABEL_DIR = ROOT / "vel_data" / "label"
-VAL_CACHE_DIR = ROOT / "vel_data" / "processed"
-
-CHECKPOINT_DIR = ROOT / "checkpoints"
 
 EPOCHS = 500
 BATCH_SIZE = 16
@@ -32,167 +20,112 @@ WEIGHT_DECAY = 1e-6
 GRAD_CLIP = 1.0
 LOG_INTERVAL = 10
 SEED = 42
-RESUME = False  # True 时从 tacotron2_latest.pt 恢复训练
-USE_AMP = True  # 混合精度，节省显存
+RESUME = False
+USE_AMP = True
 
-# 最佳模型选型指标（在验证集上，越低越好）
-# mel         -> val_mel_loss
-# mel_postnet -> val_mel_postnet_loss（推荐）
-# combined    -> COMBINED_MEL_WEIGHT * mel + COMBINED_GATE_WEIGHT * gate
-BEST_METRIC = "mel_postnet"
+BEST_METRIC = "mel_postnet"  # mel | mel_postnet | combined
 COMBINED_MEL_WEIGHT = 0.9
 COMBINED_GATE_WEIGHT = 0.1
-# ==========================================================
 
-_BEST_METRIC_LABELS = {
+_METRIC_NAME = {
     "mel": "val_mel_loss",
     "mel_postnet": "val_mel_postnet_loss",
     "combined": f"{COMBINED_MEL_WEIGHT}*mel+{COMBINED_GATE_WEIGHT}*gate",
 }
 
 
-def _best_metric_score(val_metrics: dict[str, float]) -> float:
+def _metric_score(metrics: dict[str, float]) -> float:
     if BEST_METRIC == "mel":
-        return val_metrics["mel"]
+        return metrics["mel"]
     if BEST_METRIC == "mel_postnet":
-        return val_metrics["mel_postnet"]
+        return metrics["mel_postnet"]
     if BEST_METRIC == "combined":
-        return COMBINED_MEL_WEIGHT * val_metrics["mel"] + COMBINED_GATE_WEIGHT * val_metrics["gate"]
-    raise ValueError(f"未知 BEST_METRIC: {BEST_METRIC}，可选 mel / mel_postnet / combined")
+        return COMBINED_MEL_WEIGHT * metrics["mel"] + COMBINED_GATE_WEIGHT * metrics["gate"]
+    raise ValueError(f"未知 BEST_METRIC: {BEST_METRIC}")
 
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+def _load_samples(cache_dir: Path, split_dir: Path) -> list:
+    path = cache_dir / "samples.pt"
+    if path.exists():
+        return torch.load(path, weights_only=False)
+    return discover_thchs30_samples(split_dir, cache_dir)
 
 
-def _save_checkpoint(path: Path, state: dict) -> None:
-    torch.save(state, path)
-
-
-def _load_samples(cache_dir: Path, voice_dir: Path, label_dir: Path) -> list:
-    samples_path = cache_dir / "samples.pt"
-    if samples_path.exists():
-        return torch.load(samples_path, weights_only=False)
-    return discover_samples(voice_dir, label_dir, cache_dir)
-
-
-def load_resources(device: torch.device):
-    vocab_path = TRAIN_CACHE_DIR / "vocab.json"
-    if not vocab_path.exists():
-        print("未找到预处理缓存，正在运行 preprocess ...")
-        from preprocess import preprocess
-
-        preprocess()
-
-    text_processor = TextProcessor()
-    text_processor.load(vocab_path)
-
-    train_samples = _load_samples(TRAIN_CACHE_DIR, TRAIN_VOICE_DIR, TRAIN_LABEL_DIR)
-    if not train_samples:
-        raise RuntimeError("没有可用训练样本")
-
-    val_samples = _load_samples(VAL_CACHE_DIR, VAL_VOICE_DIR, VAL_LABEL_DIR)
-    if not val_samples:
-        raise RuntimeError(f"没有可用验证样本，请检查 {VAL_VOICE_DIR} 与 {VAL_LABEL_DIR}")
-
-    audio_processor = AudioProcessor()
-
-    train_dataset = TTSDataset(train_samples, text_processor, audio_processor, use_cache=True)
-    val_dataset = TTSDataset(val_samples, text_processor, audio_processor, use_cache=True)
-    print(f"训练片段: {len(train_dataset)}，验证片段: {len(val_dataset)}（每段 {config.SEGMENT_MEL_FRAMES} 帧）")
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=min(BATCH_SIZE, len(train_dataset)),
-        shuffle=False,
+def _build_loader(samples, text_processor, audio_processor, shuffle: bool) -> DataLoader:
+    dataset = TTSDataset(samples, text_processor, audio_processor)
+    return DataLoader(
+        dataset,
+        batch_size=min(BATCH_SIZE, len(dataset)),
+        shuffle=shuffle,
         collate_fn=tts_collate_fn,
         num_workers=0,
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=min(BATCH_SIZE, len(val_dataset)),
-        shuffle=False,
-        collate_fn=tts_collate_fn,
-        num_workers=0,
-    )
-
-    model = Tacotron2(n_symbols=text_processor.n_symbols).to(device)
-    param_count = sum(p.numel() for p in model.parameters())
-    seg_sec = config.SEGMENT_MEL_FRAMES * config.HOP_LENGTH / config.SAMPLE_RATE
-    print(f"模型参数量: {param_count / 1e6:.2f}M，每段时长约: {seg_sec:.1f}s")
-    print(f"最佳模型指标: {_BEST_METRIC_LABELS[BEST_METRIC]}")
-
-    criterion = Tacotron2Loss()
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        weight_decay=WEIGHT_DECAY,
-    )
-
-    return model, criterion, optimizer, train_loader, val_loader, text_processor
 
 
 @torch.no_grad()
-def validate(
-    model: Tacotron2,
-    criterion: Tacotron2Loss,
-    val_loader: DataLoader,
-    device: torch.device,
-) -> dict[str, float]:
+def _validate(model, criterion, loader, device) -> dict[str, float]:
     model.eval()
     totals = {"total": 0.0, "mel": 0.0, "mel_postnet": 0.0, "gate": 0.0}
-    n = 0
-
-    for batch in val_loader:
+    for batch in loader:
         text = batch["text"].to(device)
         text_lengths = batch["text_lengths"].to(device)
         mel = batch["mel"].to(device)
         mel_lengths = batch["mel_lengths"].to(device)
-
         with torch.amp.autocast("cuda", enabled=USE_AMP and device.type == "cuda"):
             mel_pred, mel_postnet, gate_pred = model(text, text_lengths, mel)
             losses = criterion(mel_pred, mel_postnet, gate_pred, mel, mel_lengths)
-
         for k in totals:
             totals[k] += losses[k].item()
-        n += 1
-
+    n = max(len(loader), 1)
     return {k: v / n for k, v in totals.items()}
 
 
 def train() -> None:
-    set_seed(SEED)
+    random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"使用设备: {device}")
+    config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    if not (config.TRAIN_CACHE_DIR / "vocab.json").exists():
+        from preprocess import preprocess
+        preprocess()
 
-    model, criterion, optimizer, train_loader, val_loader, text_processor = load_resources(device)
+    text_processor = TextProcessor()
+    text_processor.load(config.TRAIN_CACHE_DIR / "vocab.json")
+    audio_processor = AudioProcessor()
+
+    train_samples = _load_samples(config.TRAIN_CACHE_DIR, config.THCHS30_TRAIN_DIR)
+    dev_samples = _load_samples(config.DEV_CACHE_DIR, config.THCHS30_DEV_DIR)
+    if not train_samples or not dev_samples:
+        raise RuntimeError("训练集或验证集为空，请先运行 preprocess.py")
+
+    train_loader = _build_loader(train_samples, text_processor, audio_processor, shuffle=True)
+    val_loader = _build_loader(dev_samples, text_processor, audio_processor, shuffle=False)
+    print(f"设备: {device} | 训练 {len(train_loader.dataset)} 段 | 验证 {len(val_loader.dataset)} 段")
+
+    model = Tacotron2(n_symbols=text_processor.n_symbols).to(device)
+    criterion = Tacotron2Loss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP and device.type == "cuda")
+
     start_epoch = 1
-    best_metric_value = float("inf")
-
-    resume_path = CHECKPOINT_DIR / "tacotron2_latest.pt"
-    if RESUME and resume_path.exists():
-        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+    best_score = float("inf")
+    latest = config.CHECKPOINT_DIR / "tacotron2_latest.pt"
+    if RESUME and latest.exists():
+        ckpt = torch.load(latest, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_epoch = ckpt["epoch"] + 1
-        best_metric_value = ckpt.get("best_metric_value", ckpt.get("best_val_loss", float("inf")))
-        print(
-            f"从 {resume_path} 恢复，epoch {start_epoch}，"
-            f"best_{_BEST_METRIC_LABELS[BEST_METRIC]}={best_metric_value:.4f}"
-        )
+        best_score = ckpt.get("best_metric_value", float("inf"))
 
-    global_step = 0
-    scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP and device.type == "cuda")
-
+    step = 0
     for epoch in range(start_epoch, EPOCHS + 1):
         model.train()
         train_loss = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS} [train]")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
 
         for batch in pbar:
             text = batch["text"].to(device)
@@ -201,7 +134,6 @@ def train() -> None:
             mel_lengths = batch["mel_lengths"].to(device)
 
             optimizer.zero_grad(set_to_none=True)
-
             with torch.amp.autocast("cuda", enabled=USE_AMP and device.type == "cuda"):
                 mel_pred, mel_postnet, gate_pred = model(text, text_lengths, mel)
                 losses = criterion(mel_pred, mel_postnet, gate_pred, mel, mel_lengths)
@@ -213,20 +145,16 @@ def train() -> None:
             scaler.update()
 
             train_loss += losses["total"].item()
-            global_step += 1
-
-            if global_step % LOG_INTERVAL == 0:
+            step += 1
+            if step % LOG_INTERVAL == 0:
                 pbar.set_postfix(loss=f"{losses['total'].item():.4f}")
 
-        avg_train_loss = train_loss / len(train_loader)
-        val_metrics = validate(model, criterion, val_loader, device)
-        metric_score = _best_metric_score(val_metrics)
-
+        val_metrics = _validate(model, criterion, val_loader, device)
+        score = _metric_score(val_metrics)
         print(
-            f"Epoch {epoch} | train_loss={avg_train_loss:.4f} | "
-            f"val_mel={val_metrics['mel']:.4f} | val_mel_postnet={val_metrics['mel_postnet']:.4f} | "
-            f"val_gate={val_metrics['gate']:.4f} | "
-            f"{_BEST_METRIC_LABELS[BEST_METRIC]}={metric_score:.4f}"
+            f"Epoch {epoch} train={train_loss / len(train_loader):.4f} | "
+            f"val_mel={val_metrics['mel']:.4f} val_postnet={val_metrics['mel_postnet']:.4f} | "
+            f"{_METRIC_NAME[BEST_METRIC]}={score:.4f}"
         )
 
         state = {
@@ -234,25 +162,18 @@ def train() -> None:
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "n_symbols": text_processor.n_symbols,
-            "train_loss": avg_train_loss,
             "val_metrics": val_metrics,
             "best_metric": BEST_METRIC,
-            "best_metric_value": best_metric_value,
+            "best_metric_value": best_score,
         }
+        torch.save(state, latest)
+        if score < best_score:
+            best_score = score
+            state["best_metric_value"] = best_score
+            torch.save(state, config.CHECKPOINT_DIR / "tacotron2_best.pt")
+            print(f"保存最佳模型 ({_METRIC_NAME[BEST_METRIC]}={best_score:.4f})")
 
-        _save_checkpoint(CHECKPOINT_DIR / "tacotron2_latest.pt", state)
-        print("已保存最新模型: tacotron2_latest.pt")
-
-        if metric_score < best_metric_value:
-            best_metric_value = metric_score
-            state["best_metric_value"] = best_metric_value
-            _save_checkpoint(CHECKPOINT_DIR / "tacotron2_best.pt", state)
-            print(
-                f"已保存最佳模型: tacotron2_best.pt"
-                f"（{_BEST_METRIC_LABELS[BEST_METRIC]}={best_metric_value:.4f}）"
-            )
-
-    print(f"训练完成，最佳 {_BEST_METRIC_LABELS[BEST_METRIC]}: {best_metric_value:.4f}")
+    print(f"训练完成，最佳 {_METRIC_NAME[BEST_METRIC]}={best_score:.4f}")
 
 
 if __name__ == "__main__":
